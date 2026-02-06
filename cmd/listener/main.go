@@ -7,7 +7,6 @@ import (
 	"log"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"multi-cast-transfer/internal/client"
 	"multi-cast-transfer/internal/config"
@@ -47,17 +46,17 @@ func main() {
 		log.Fatalf("listen multicast: %v", err)
 	}
 
-	seen := make(map[string]time.Time)
+	seen := make(map[string]int64) // advert ID -> last timestamp processed
 	for {
 		select {
 		case ad, ok := <-adverts:
 			if !ok {
 				return
 			}
-			if _, exists := seen[ad.ID]; exists {
+			if last, exists := seen[ad.ID]; exists && ad.Timestamp <= last {
 				continue
 			}
-			seen[ad.ID] = time.Now()
+			seen[ad.ID] = ad.Timestamp
 
 			expected := ad.ServerName
 			if *serverName != "" {

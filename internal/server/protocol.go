@@ -13,7 +13,9 @@ const magic = "MCAST1"
 // FileEntry describes a file to transfer.
 type FileEntry struct {
 	Name string `json:"name"`
+	Path string `json:"path"`
 	Size int64  `json:"size"`
+	Hash string `json:"hash"`
 }
 
 // Manifest lists the files the server will stream.

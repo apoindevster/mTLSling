@@ -3,13 +3,17 @@ package server
 import (
 	"context"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
+
+	"lukechampine.com/blake3"
 )
 
 // FileProvider returns the list of files to serve.
@@ -25,10 +29,13 @@ func (f FileProviderFunc) ListFiles() []string { return f() }
 
 // ConnEvent describes a connection lifecycle change.
 type ConnEvent struct {
-	ID     string
-	Remote string
-	State  string // e.g., "accepted", "completed", "error"
-	Err    error
+	ID          string
+	Remote      string
+	State       string // e.g., "accepted", "completed", "error"
+	Err         error
+	File        string
+	Transferred int64
+	Total       int64
 }
 
 // Server handles TLS file transfers.
@@ -49,7 +56,7 @@ func New(addr string, tlsCfg *tls.Config, provider FileProvider) *Server {
 		addr:        addr,
 		tlsConfig:   tlsCfg,
 		provider:    provider,
-		events:      make(chan ConnEvent, 8),
+		events:      make(chan ConnEvent, 64),
 		stopped:     make(chan struct{}),
 		connections: make(map[string]net.Conn),
 	}
@@ -128,7 +135,13 @@ func (s *Server) handleConn(ctx context.Context, id string, c net.Conn) {
 		if info.IsDir() {
 			continue
 		}
-		entries = append(entries, FileEntry{Name: filepath.Base(path), Size: info.Size()})
+		hash, err := fileHash(path)
+		if err != nil {
+			s.events <- ConnEvent{ID: id, Remote: c.RemoteAddr().String(), State: "error", Err: fmt.Errorf("hash %s: %w", path, err)}
+			return
+		}
+		rel := relativePath(path)
+		entries = append(entries, FileEntry{Name: filepath.Base(path), Path: rel, Size: info.Size(), Hash: hash})
 	}
 
 	if err := WriteManifest(c, Manifest{Files: entries}); err != nil {
@@ -136,13 +149,31 @@ func (s *Server) handleConn(ctx context.Context, id string, c net.Conn) {
 		return
 	}
 
+	buf := make([]byte, 1)
 	for i, entry := range entries {
+		// Wait for client decision: 1 = send, 0 = skip
+		if _, err := io.ReadFull(c, buf); err != nil {
+			s.events <- ConnEvent{ID: id, Remote: c.RemoteAddr().String(), State: "error", Err: fmt.Errorf("read decision: %w", err)}
+			return
+		}
+		if buf[0] == 0 {
+			continue
+		}
+
 		f, err := os.Open(files[i])
 		if err != nil {
 			s.events <- ConnEvent{ID: id, Remote: c.RemoteAddr().String(), State: "error", Err: err}
 			return
 		}
-		if _, err := io.CopyN(c, f, entry.Size); err != nil {
+		pw := &progressWriter{
+			Conn:   c,
+			ID:     id,
+			Remote: c.RemoteAddr().String(),
+			File:   entry.Path,
+			Total:  entry.Size,
+			Events: s.events,
+		}
+		if _, err := io.CopyN(pw, f, entry.Size); err != nil {
 			f.Close()
 			s.events <- ConnEvent{ID: id, Remote: c.RemoteAddr().String(), State: "error", Err: err}
 			return
@@ -150,4 +181,62 @@ func (s *Server) handleConn(ctx context.Context, id string, c net.Conn) {
 		f.Close()
 	}
 	s.events <- ConnEvent{ID: id, Remote: c.RemoteAddr().String(), State: "completed"}
+}
+
+// progressWriter reports copy progress while writing to a connection.
+type progressWriter struct {
+	Conn   net.Conn
+	ID     string
+	Remote string
+	File   string
+	Total  int64
+	Sent   int64
+	last   time.Time
+	Events chan<- ConnEvent
+}
+
+func (w *progressWriter) Write(p []byte) (int, error) {
+	n, err := w.Conn.Write(p)
+	w.Sent += int64(n)
+	now := time.Now()
+	if w.Total > 0 && (now.Sub(w.last) > 150*time.Millisecond || w.Sent == w.Total) {
+		select {
+		case w.Events <- ConnEvent{
+			ID:          w.ID,
+			Remote:      w.Remote,
+			State:       "progress",
+			File:        w.File,
+			Transferred: w.Sent,
+			Total:       w.Total,
+		}:
+		default:
+			// drop if channel is full to avoid blocking
+		}
+		w.last = now
+	}
+	return n, err
+}
+
+// fileHash returns the SHA-256 hex digest of the file.
+func fileHash(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := blake3.New(32, nil)
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// relativePath produces a path without volume/leading separators so it can be joined under the destination root.
+func relativePath(path string) string {
+	clean := filepath.Clean(path)
+	if vol := filepath.VolumeName(clean); vol != "" {
+		clean = strings.TrimPrefix(clean, vol)
+	}
+	clean = strings.TrimPrefix(clean, string(filepath.Separator))
+	return clean
 }
