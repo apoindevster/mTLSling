@@ -4,7 +4,8 @@ Two Go binaries for local network file transfer with multicast discovery and mut
 
 ## Binaries
 - `listener` (headless): Joins a multicast group, authenticates signed adverts, then connects back over TLS and downloads advertised files.
-- `tui` (Bubble Tea UI): Lets you pick files to share, starts/stops the TLS listener, broadcasts signed adverts over multicast, and shows incoming connection events.
+- `senderd` (headless): Owns sender functionality (TLS file server + multicast broadcaster) and exposes local IPC control APIs.
+- `tui` (Bubble Tea UI): UI-only controller. Talks to `senderd` over IPC to manage files, start/stop transfer service, and show connection/progress state.
 
 ## Quick start
 1. Generate a small PKI (CA + server + client certs). Example:
@@ -36,14 +37,21 @@ Two Go binaries for local network file transfer with multicast discovery and mut
    openssl x509 -req -in certs/client.csr -CA certs/ca.crt -CAkey certs/ca.key -CAcreateserial -out certs/client.crt -days 365
    ```
 
-2. Start the TUI sender (select files, press `s` to start broadcasting and listening):
+2. Start the headless sender daemon:
    ```bash
-   GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod go run ./cmd/tui \
+   GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod go run ./cmd/senderd \
      -cert certs/server.crt -key certs/server.key -ca certs/ca.crt \
-     -addr ":8443" -multicast "239.255.42.99:9999" -server-name "transfer.local" -id sender-1
+     -addr ":8443" -multicast "239.255.42.99:9999" -server-name "transfer.local" -id sender-1 \
+     -ipc-socket /tmp/multi-cast-transfer.sock
    ```
 
-3. Run the headless listener on another host (downloads into ./downloads by default):
+3. Start the TUI and control `senderd` over IPC (pick files, press `s` to start/stop):
+   ```bash
+   GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod go run ./cmd/tui \
+     -ipc-socket /tmp/multi-cast-transfer.sock
+   ```
+
+4. Run the headless listener on another host (downloads into ./downloads by default):
    ```bash
    GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod go run ./cmd/listener \
      -cert certs/client.crt -key certs/client.key -ca certs/ca.crt \
@@ -55,7 +63,8 @@ Two Go binaries for local network file transfer with multicast discovery and mut
 - Both discovery and TCP transfers enforce TLS 1.3 mutual authentication.
 - Listener caches advert IDs to avoid repeated downloads in a single run.
 - Environment variables `GOCACHE` and `GOMODCACHE` are set in the examples to keep build artifacts inside writable directories.
-- Both binaries expose `-insecure-skip-verify` to bypass CA validation for testing (not recommended in production).
+- `senderd` and `listener` expose `-insecure-skip-verify` to bypass CA validation for testing (not recommended in production).
+- IPC is isolated in `internal/ipc` behind build tags (`!windows` and `windows`) so transport can be swapped for Windows later without changing daemon/TUI business logic.
 
 ## Next steps
 - Add persistence for selected files/config in the TUI.

@@ -1,38 +1,25 @@
 package main
 
 import (
-	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"flag"
 	"fmt"
 	"log"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/bubbles/filepicker"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/progress"
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"multi-cast-transfer/internal/config"
-	"multi-cast-transfer/internal/discovery"
-	"multi-cast-transfer/internal/server"
+	"multi-cast-transfer/internal/ipc"
+	"multi-cast-transfer/internal/ipcapi"
+	"multi-cast-transfer/internal/senderdaemon"
 )
-
-// messages
-
-type connEventMsg server.ConnEvent
-
-type errMsg struct{ err error }
-
-type serverStoppedMsg struct{}
-
-type broadcastStoppedMsg struct{}
-
-// pages
 
 type page int
 
@@ -41,53 +28,76 @@ const (
 	pageSelected
 	pageConnections
 	pageDetails
+	pageSettings
 )
 
-// model holds UI state.
+type settingKey string
+
+const (
+	keySenderEnabled           settingKey = "sender.enabled"
+	keySenderCert              settingKey = "sender.cert_path"
+	keySenderKey               settingKey = "sender.key_path"
+	keySenderCA                settingKey = "sender.ca_path"
+	keySenderAddr              settingKey = "sender.addr"
+	keySenderMulticast         settingKey = "sender.multicast"
+	keySenderServerName        settingKey = "sender.server_name"
+	keySenderID                settingKey = "sender.id"
+	keySenderInsecure          settingKey = "sender.insecure_skip_verify"
+	keySenderBroadcastInterval settingKey = "sender.broadcast_interval_seconds"
+	keyListenerEnabled         settingKey = "listener.enabled"
+	keyListenerCert            settingKey = "listener.cert_path"
+	keyListenerKey             settingKey = "listener.key_path"
+	keyListenerCA              settingKey = "listener.ca_path"
+	keyListenerMulticast       settingKey = "listener.multicast"
+	keyListenerOut             settingKey = "listener.out_dir"
+	keyListenerServerName      settingKey = "listener.server_name_override"
+	keyListenerInsecure        settingKey = "listener.insecure_skip_verify"
+)
+
+type stateMsg struct {
+	snapshot senderdaemon.Snapshot
+	err      error
+}
+
+type actionMsg struct {
+	snapshot   senderdaemon.Snapshot
+	err        error
+	clearDirty bool
+}
+
+type tickMsg struct{}
+
 type model struct {
-	page        page
-	fp          filepicker.Model
-	fileList    list.Model
-	connList    list.Model
+	page         page
+	fp           filepicker.Model
+	fileList     list.Model
+	connList     list.Model
+	settingsList list.Model
+
+	editInput textinput.Model
+	editing   bool
+	editKey   settingKey
+
 	detailID    string
-	connections map[string]*connInfo
+	connections map[string]senderdaemon.ConnectionSnapshot
+	recent      []senderdaemon.ListenerEvent
 
-	running    bool
-	addr       string
-	multicast  string
-	serverName string
-	id         string
-	insecure   bool
+	settings      senderdaemon.Settings
+	settingsDirty bool
 
-	tlsCert tls.Certificate
-	roots   *x509.CertPool
+	senderRunning   bool
+	listenerRunning bool
+	senderError     string
+	listenerError   string
+	uiError         string
 
-	srv    *server.Server
-	runCtx context.Context
-	cancel context.CancelFunc
-	advert *discovery.Advert
+	client *ipcapi.Client
 
 	width  int
 	height int
 }
 
-// connection tracking
-
-type connInfo struct {
-	id     string
-	remote string
-	state  string
-	files  map[string]*fileProg
-}
-
-type fileProg struct {
-	name        string
-	total       int64
-	transferred int64
-	bar         progress.Model
-}
-
-func newModel(cert tls.Certificate, roots *x509.CertPool, addr, multicast, serverName, id string, insecure bool) model {
+func newModel(client *ipcapi.Client) model {
 	fp := filepicker.New()
 	fp.ShowHidden = false
 	fp.AutoHeight = true
@@ -105,65 +115,73 @@ func newModel(cert tls.Certificate, roots *x509.CertPool, addr, multicast, serve
 	cl.SetShowStatusBar(false)
 	cl.DisableQuitKeybindings()
 	cl.SetFilteringEnabled(false)
-	cl.Title = "Connections (enter=details)"
+	cl.Title = "Sender connections (enter=details)"
 
-	return model{
-		page:        pagePicker,
-		fp:          fp,
-		fileList:    fl,
-		connList:    cl,
-		connections: make(map[string]*connInfo),
-		addr:        addr,
-		multicast:   multicast,
-		serverName:  serverName,
-		id:          id,
-		insecure:    insecure,
-		tlsCert:     cert,
-		roots:       roots,
+	settingsDelegate := list.NewDefaultDelegate()
+	sl := list.New([]list.Item{}, settingsDelegate, 0, 0)
+	sl.SetShowStatusBar(false)
+	sl.DisableQuitKeybindings()
+	sl.SetFilteringEnabled(false)
+	sl.Title = "Daemon settings"
+
+	ti := textinput.New()
+	ti.Prompt = "value> "
+	ti.CharLimit = 512
+
+	m := model{
+		page:         pagePicker,
+		fp:           fp,
+		fileList:     fl,
+		connList:     cl,
+		settingsList: sl,
+		editInput:    ti,
+		connections:  make(map[string]senderdaemon.ConnectionSnapshot),
+		client:       client,
 	}
+	m.rebuildSettingsList()
+	return m
 }
 
 func (m model) Init() tea.Cmd {
-	return m.fp.Init()
+	return tea.Batch(m.fp.Init(), requestStateCmd(m.client))
 }
 
-// Update handles all messages.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.page == pageSettings && m.editing {
+			return m.updateEditing(msg)
+		}
+
 		switch msg.String() {
 		case "ctrl+c", "q":
-			if m.running && m.cancel != nil {
-				m.cancel()
-			}
 			return m, tea.Quit
 		case "tab":
-			m.page = (m.page + 1) % 4
-		case "f", "p":
+			m.page = (m.page + 1) % 5
+		case "p", "f":
 			m.page = pagePicker
 		case "l":
 			m.page = pageSelected
 		case "c":
 			m.page = pageConnections
+		case "g":
+			m.page = pageSettings
 		case "b":
 			if m.page == pageDetails {
 				m.page = pageConnections
 			}
 		case "s":
-			if m.running {
-				if m.cancel != nil {
-					m.cancel()
-				}
-				return m, nil
+			if m.senderRunning {
+				return m, stopSenderCmd(m.client)
 			}
-			cmd, err := m.start()
-			if err != nil {
-				return m, tea.Printf("error: %v", err)
+			return m, startSenderCmd(m.client)
+		case "r":
+			if m.listenerRunning {
+				return m, stopListenerCmd(m.client)
 			}
-			return m, cmd
+			return m, startListenerCmd(m.client)
 		}
 
-		// page-specific key handling
 		switch m.page {
 		case pageSelected:
 			if msg.String() == "d" && len(m.fileList.Items()) > 0 {
@@ -171,7 +189,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				items := m.fileList.Items()
 				if idx >= 0 && idx < len(items) {
 					items = append(items[:idx], items[idx+1:]...)
-					m.fileList.SetItems(items)
+					paths := listItemsToPaths(items)
+					m.syncFiles(paths)
+					return m, setFilesCmd(m.client, paths)
 				}
 			}
 		case pageConnections:
@@ -181,60 +201,105 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.page = pageDetails
 				}
 			}
-		case pageDetails:
-			// handled via 'b' to go back
+		case pageSettings:
+			if msg.String() == "space" {
+				if m.toggleSelectedSetting() {
+					return m, nil
+				}
+			}
+			if msg.String() == "e" {
+				m.beginEditSelectedSetting()
+				return m, nil
+			}
+			if msg.String() == "w" {
+				return m, updateSettingsCmd(m.client, m.settings)
+			}
 		}
-
-	case connEventMsg:
-		m.applyConnEvent(server.ConnEvent(msg))
-		return m, listenEventsCmd(m.srv.Events())
-
-	case errMsg:
-		m.running = false
-		return m, tea.Printf("error: %v", msg.err)
-
-	case serverStoppedMsg:
-		m.running = false
-		return m, nil
-
-	case broadcastStoppedMsg:
-		return m, nil
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-		h := msg.Height - 8
+		h := msg.Height - 9
 		if h < 6 {
 			h = 6
 		}
 		m.fp.SetHeight(h)
 		m.fileList.SetSize(msg.Width, h)
-		m.connList.SetSize(msg.Width, h)
+		m.connList.SetSize(msg.Width, h/2)
+		m.settingsList.SetSize(msg.Width, h)
 		return m, nil
+
+	case stateMsg:
+		if msg.err != nil {
+			m.uiError = msg.err.Error()
+			return m, nextPollCmd()
+		}
+		m.uiError = ""
+		m.applySnapshot(msg.snapshot)
+		return m, nextPollCmd()
+
+	case actionMsg:
+		if msg.err != nil {
+			m.uiError = msg.err.Error()
+			return m, requestStateCmd(m.client)
+		}
+		if msg.clearDirty {
+			m.settingsDirty = false
+		}
+		m.uiError = ""
+		m.applySnapshot(msg.snapshot)
+		return m, nil
+
+	case tickMsg:
+		return m, requestStateCmd(m.client)
 	}
 
-	// default per-page updates
 	var cmd tea.Cmd
 	switch m.page {
 	case pagePicker:
 		var c1 tea.Cmd
 		m.fp, c1 = m.fp.Update(msg)
-		cmd = tea.Batch(cmd, c1)
+		cmd = c1
 		if ok, path := m.fp.DidSelectFile(msg); ok {
-			items := append(m.fileList.Items(), fileItem{path: path})
-			m.fileList.SetItems(items)
+			files := appendUnique(listItemsToPaths(m.fileList.Items()), path)
+			m.syncFiles(files)
+			return m, tea.Batch(cmd, setFilesCmd(m.client, files))
 		}
 	case pageSelected:
 		var c2 tea.Cmd
 		m.fileList, c2 = m.fileList.Update(msg)
-		cmd = tea.Batch(cmd, c2)
+		cmd = c2
 	case pageConnections:
-		var c tea.Cmd
-		m.connList, c = m.connList.Update(msg)
-		cmd = tea.Batch(cmd, c)
-	case pageDetails:
-		// no interactive widgets here
+		var c3 tea.Cmd
+		m.connList, c3 = m.connList.Update(msg)
+		cmd = c3
+	case pageSettings:
+		var c4 tea.Cmd
+		m.settingsList, c4 = m.settingsList.Update(msg)
+		cmd = c4
 	}
 
+	return m, cmd
+}
+
+func (m model) updateEditing(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.editing = false
+		m.editKey = ""
+		return m, nil
+	case "enter":
+		if err := m.commitSettingEdit(strings.TrimSpace(m.editInput.Value())); err != nil {
+			m.uiError = err.Error()
+			return m, nil
+		}
+		m.editing = false
+		m.editKey = ""
+		m.settingsDirty = true
+		m.rebuildSettingsList()
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.editInput, cmd = m.editInput.Update(msg)
 	return m, cmd
 }
 
@@ -248,6 +313,8 @@ func (m model) View() string {
 		return m.viewConnections()
 	case pageDetails:
 		return m.viewDetails()
+	case pageSettings:
+		return m.viewSettings()
 	default:
 		return ""
 	}
@@ -255,129 +322,274 @@ func (m model) View() string {
 
 func (m model) viewPicker() string {
 	b := &strings.Builder{}
-	status := "stopped"
-	if m.running {
-		status = "running"
+	fmt.Fprintln(b, m.statusBanner())
+	fmt.Fprintln(b)
+	fmt.Fprintf(b, "Picker\n")
+	fmt.Fprintf(b, "Keys: tab cycle | l selected | c connections | g settings | s toggle sender | r toggle listener | q quit\n")
+	fmt.Fprintf(b, "Selected files: %d\n", len(m.fileList.Items()))
+	if m.uiError != "" {
+		fmt.Fprintf(b, "UI error: %s\n", m.uiError)
 	}
-	fmt.Fprintf(b, "Picker page | status: %s | listen %s | multicast %s\n", status, m.addr, m.multicast)
-	fmt.Fprintf(b, "Select files with arrows+enter. Tab/p/f to stay here, l=selected list, c=connections, s=start/stop, q=quit.\n")
-	fmt.Fprintf(b, "Selected: %d files (press 'l' to manage)\n\n", len(m.fileList.Items()))
+	if m.senderError != "" {
+		fmt.Fprintf(b, "Sender error: %s\n", m.senderError)
+	}
+	if m.listenerError != "" {
+		fmt.Fprintf(b, "Listener error: %s\n", m.listenerError)
+	}
+	fmt.Fprintln(b)
 	fmt.Fprintln(b, m.fp.View())
 	return b.String()
 }
 
 func (m model) viewSelected() string {
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "Selected files | d=delete | tab to cycle | p/f=picker | c=connections | s=start/stop | q=quit\n\n")
+	fmt.Fprintln(b, m.statusBanner())
+	fmt.Fprintln(b)
+	fmt.Fprintf(b, "Selected files | d delete | tab cycle | p/f picker | g settings\n\n")
 	fmt.Fprintln(b, m.fileList.View())
 	return b.String()
 }
 
 func (m model) viewConnections() string {
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "Connections page | enter=details | tab to cycle | s=start/stop | q=quit\n\n")
+	fmt.Fprintln(b, m.statusBanner())
+	fmt.Fprintln(b)
+	fmt.Fprintf(b, "Connections | enter details | s toggle sender | r toggle listener | g settings\n")
+	if m.uiError != "" {
+		fmt.Fprintf(b, "UI error: %s\n", m.uiError)
+	}
+	fmt.Fprintln(b)
 	fmt.Fprintln(b, m.connList.View())
+	fmt.Fprintln(b, "Listener recent activity:")
+	if len(m.recent) == 0 {
+		fmt.Fprintln(b, "  (none)")
+	} else {
+		for i, ev := range m.recent {
+			if i >= 8 {
+				break
+			}
+			fmt.Fprintf(b, "  %s %s %s %s\n", ev.Timestamp.Format("15:04:05"), ev.Status, ev.Callback, ev.Detail)
+		}
+	}
 	return b.String()
 }
 
 func (m model) viewDetails() string {
 	b := &strings.Builder{}
-	fmt.Fprintf(b, "Connection details | id=%s | b=back | tab to cycle\n\n", m.detailID)
+	fmt.Fprintln(b, m.statusBanner())
+	fmt.Fprintln(b)
+	fmt.Fprintf(b, "Connection details | id=%s | b back\n\n", m.detailID)
 	ci, ok := m.connections[m.detailID]
 	if !ok {
 		fmt.Fprintln(b, "No data for connection.")
 		return b.String()
 	}
-	fmt.Fprintf(b, "Remote: %s | State: %s\n\n", ci.remote, ci.state)
-	names := make([]string, 0, len(ci.files))
-	for name := range ci.files {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	for _, name := range names {
-		fp := ci.files[name]
+	fmt.Fprintf(b, "Remote: %s | State: %s\n\n", ci.Remote, ci.State)
+	files := append([]senderdaemon.FileProgressSnapshot(nil), ci.Files...)
+	sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
+	for _, fp := range files {
 		pct := 0.0
-		if fp.total > 0 {
-			pct = float64(fp.transferred) / float64(fp.total)
+		if fp.Total > 0 {
+			pct = float64(fp.Transferred) / float64(fp.Total)
 		}
-		bar := fp.bar.ViewAs(pct)
-		fmt.Fprintf(b, "%s (%d/%d bytes)\n%s\n", name, fp.transferred, fp.total, bar)
+		bar := progress.New(progress.WithDefaultGradient())
+		bar.Width = max(20, m.width-20)
+		fmt.Fprintf(b, "%s (%d/%d bytes)\n%s\n", fp.Name, fp.Transferred, fp.Total, bar.ViewAs(pct))
 	}
-	if len(names) == 0 {
+	if len(files) == 0 {
 		fmt.Fprintln(b, "No file progress yet.")
 	}
 	return b.String()
 }
 
-// start spins up the TLS server and multicast broadcaster.
-func (m *model) start() (tea.Cmd, error) {
-	if len(m.fileList.Items()) == 0 {
-		return nil, fmt.Errorf("no files selected")
+func (m model) viewSettings() string {
+	b := &strings.Builder{}
+	fmt.Fprintln(b, m.statusBanner())
+	fmt.Fprintln(b)
+	dirty := "saved"
+	if m.settingsDirty {
+		dirty = "modified"
 	}
-
-	files := make([]string, 0, len(m.fileList.Items()))
-	for _, it := range m.fileList.Items() {
-		if fi, ok := it.(fileItem); ok {
-			files = append(files, fi.path)
-		}
+	fmt.Fprintf(b, "Settings (%s) | arrows navigate | e edit | space toggle bool | w write/apply\n", dirty)
+	fmt.Fprintf(b, "Keys: tab cycle | p picker | c connections | s toggle sender | r toggle listener\n")
+	if m.uiError != "" {
+		fmt.Fprintf(b, "UI error: %s\n", m.uiError)
 	}
-
-	tlsCfg := config.ServerTLSConfig(m.tlsCert, m.roots, m.insecure)
-	srv := server.New(m.addr, tlsCfg, server.FileProviderFunc(func() []string { return files }))
-
-	advert, err := discovery.NewAdvert(m.id, m.addr, m.serverName, m.tlsCert)
-	if err != nil {
-		return nil, err
+	fmt.Fprintln(b)
+	fmt.Fprintln(b, m.settingsList.View())
+	if m.editing {
+		fmt.Fprintln(b)
+		fmt.Fprintf(b, "Editing %s (enter save, esc cancel)\n", m.editKey)
+		fmt.Fprintln(b, m.editInput.View())
 	}
-	m.advert = advert
-
-	ctx, cancel := context.WithCancel(context.Background())
-	m.runCtx = ctx
-	m.cancel = cancel
-	m.srv = srv
-	m.running = true
-
-	// reset connection tracking
-	m.connections = make(map[string]*connInfo)
-	m.connList.SetItems(nil)
-	m.detailID = ""
-
-	return tea.Batch(
-		runServerCmd(srv, ctx),
-		runBroadcastCmd(m.multicast, advert, ctx),
-		listenEventsCmd(srv.Events()),
-	), nil
+	return b.String()
 }
 
-func runServerCmd(s *server.Server, ctx context.Context) tea.Cmd {
-	return func() tea.Msg {
-		if err := s.Start(ctx); err != nil {
-			return errMsg{err: err}
-		}
-		return serverStoppedMsg{}
-	}
-}
+func (m *model) applySnapshot(s senderdaemon.Snapshot) {
+	m.senderRunning = s.Sender.Running
+	m.listenerRunning = s.Listener.Running
+	m.senderError = s.Sender.LastError
+	m.listenerError = s.Listener.LastError
+	m.recent = s.Listener.Recent
 
-func runBroadcastCmd(multicast string, advert *discovery.Advert, ctx context.Context) tea.Cmd {
-	return func() tea.Msg {
-		if err := discovery.Broadcast(ctx, multicast, advert, 5*time.Second); err != nil {
-			return errMsg{err: err}
-		}
-		return broadcastStoppedMsg{}
+	if !m.settingsDirty && !m.editing {
+		m.settings = s.Settings
+		m.rebuildSettingsList()
 	}
-}
 
-func listenEventsCmd(events <-chan server.ConnEvent) tea.Cmd {
-	return func() tea.Msg {
-		ev, ok := <-events
-		if !ok {
-			return serverStoppedMsg{}
+	m.syncFiles(s.Sender.Files)
+
+	m.connections = make(map[string]senderdaemon.ConnectionSnapshot, len(s.Sender.Connections))
+	items := make([]list.Item, 0, len(s.Sender.Connections))
+	for _, c := range s.Sender.Connections {
+		m.connections[c.ID] = c
+		items = append(items, connItem{id: c.ID, remote: c.Remote, state: c.State})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].(connItem).id < items[j].(connItem).id
+	})
+	m.connList.SetItems(items)
+
+	if m.detailID != "" {
+		if _, ok := m.connections[m.detailID]; !ok {
+			m.detailID = ""
+			m.page = pageConnections
 		}
-		return connEventMsg(ev)
 	}
 }
 
-// list items
+func (m *model) syncFiles(paths []string) {
+	items := make([]list.Item, 0, len(paths))
+	for _, p := range paths {
+		items = append(items, fileItem{path: p})
+	}
+	m.fileList.SetItems(items)
+}
+
+func (m *model) rebuildSettingsList() {
+	idx := m.settingsList.Index()
+	items := []list.Item{
+		settingItem{key: keySenderEnabled, label: "sender.enabled", value: strconv.FormatBool(m.settings.Sender.Enabled), togglable: true},
+		settingItem{key: keySenderCert, label: "sender.cert_path", value: m.settings.Sender.CertPath, editable: true},
+		settingItem{key: keySenderKey, label: "sender.key_path", value: m.settings.Sender.KeyPath, editable: true},
+		settingItem{key: keySenderCA, label: "sender.ca_path", value: m.settings.Sender.CAPath, editable: true},
+		settingItem{key: keySenderAddr, label: "sender.addr", value: m.settings.Sender.Addr, editable: true},
+		settingItem{key: keySenderMulticast, label: "sender.multicast", value: m.settings.Sender.Multicast, editable: true},
+		settingItem{key: keySenderServerName, label: "sender.server_name", value: m.settings.Sender.ServerName, editable: true},
+		settingItem{key: keySenderID, label: "sender.id", value: m.settings.Sender.ID, editable: true},
+		settingItem{key: keySenderInsecure, label: "sender.insecure_skip_verify", value: strconv.FormatBool(m.settings.Sender.InsecureSkipVerify), togglable: true},
+		settingItem{key: keySenderBroadcastInterval, label: "sender.broadcast_interval_seconds", value: strconv.Itoa(m.settings.Sender.BroadcastIntervalSeconds), editable: true},
+		settingItem{key: keyListenerEnabled, label: "listener.enabled", value: strconv.FormatBool(m.settings.Listener.Enabled), togglable: true},
+		settingItem{key: keyListenerCert, label: "listener.cert_path", value: m.settings.Listener.CertPath, editable: true},
+		settingItem{key: keyListenerKey, label: "listener.key_path", value: m.settings.Listener.KeyPath, editable: true},
+		settingItem{key: keyListenerCA, label: "listener.ca_path", value: m.settings.Listener.CAPath, editable: true},
+		settingItem{key: keyListenerMulticast, label: "listener.multicast", value: m.settings.Listener.Multicast, editable: true},
+		settingItem{key: keyListenerOut, label: "listener.out_dir", value: m.settings.Listener.OutDir, editable: true},
+		settingItem{key: keyListenerServerName, label: "listener.server_name_override", value: m.settings.Listener.ServerNameOverride, editable: true},
+		settingItem{key: keyListenerInsecure, label: "listener.insecure_skip_verify", value: strconv.FormatBool(m.settings.Listener.InsecureSkipVerify), togglable: true},
+	}
+	m.settingsList.SetItems(items)
+	if len(items) == 0 {
+		return
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(items) {
+		idx = len(items) - 1
+	}
+	m.settingsList.Select(idx)
+}
+
+func (m *model) selectedSetting() (settingItem, bool) {
+	item, ok := m.settingsList.SelectedItem().(settingItem)
+	return item, ok
+}
+
+func (m *model) toggleSelectedSetting() bool {
+	item, ok := m.selectedSetting()
+	if !ok || !item.togglable {
+		return false
+	}
+	switch item.key {
+	case keySenderEnabled:
+		m.settings.Sender.Enabled = !m.settings.Sender.Enabled
+	case keySenderInsecure:
+		m.settings.Sender.InsecureSkipVerify = !m.settings.Sender.InsecureSkipVerify
+	case keyListenerEnabled:
+		m.settings.Listener.Enabled = !m.settings.Listener.Enabled
+	case keyListenerInsecure:
+		m.settings.Listener.InsecureSkipVerify = !m.settings.Listener.InsecureSkipVerify
+	default:
+		return false
+	}
+	m.settingsDirty = true
+	m.rebuildSettingsList()
+	return true
+}
+
+func (m *model) beginEditSelectedSetting() {
+	item, ok := m.selectedSetting()
+	if !ok || !item.editable {
+		return
+	}
+	m.editing = true
+	m.editKey = item.key
+	m.editInput.SetValue(item.value)
+	m.editInput.Focus()
+}
+
+func (m *model) commitSettingEdit(value string) error {
+	switch m.editKey {
+	case keySenderCert:
+		m.settings.Sender.CertPath = value
+	case keySenderKey:
+		m.settings.Sender.KeyPath = value
+	case keySenderCA:
+		m.settings.Sender.CAPath = value
+	case keySenderAddr:
+		m.settings.Sender.Addr = value
+	case keySenderMulticast:
+		m.settings.Sender.Multicast = value
+	case keySenderServerName:
+		m.settings.Sender.ServerName = value
+	case keySenderID:
+		m.settings.Sender.ID = value
+	case keySenderBroadcastInterval:
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			return fmt.Errorf("broadcast interval must be a positive integer")
+		}
+		m.settings.Sender.BroadcastIntervalSeconds = n
+	case keyListenerCert:
+		m.settings.Listener.CertPath = value
+	case keyListenerKey:
+		m.settings.Listener.KeyPath = value
+	case keyListenerCA:
+		m.settings.Listener.CAPath = value
+	case keyListenerMulticast:
+		m.settings.Listener.Multicast = value
+	case keyListenerOut:
+		m.settings.Listener.OutDir = value
+	case keyListenerServerName:
+		m.settings.Listener.ServerNameOverride = value
+	default:
+		return fmt.Errorf("setting %s is not editable", m.editKey)
+	}
+	return nil
+}
+
+type settingItem struct {
+	key       settingKey
+	label     string
+	value     string
+	editable  bool
+	togglable bool
+}
+
+func (s settingItem) Title() string       { return s.label }
+func (s settingItem) Description() string { return s.value }
+func (s settingItem) FilterValue() string { return s.label }
 
 type fileItem struct{ path string }
 
@@ -395,53 +607,76 @@ func (c connItem) Title() string       { return fmt.Sprintf("%s (%s)", c.id, c.s
 func (c connItem) Description() string { return c.remote }
 func (c connItem) FilterValue() string { return c.id }
 
-// event application
-
-func (m *model) applyConnEvent(ev server.ConnEvent) {
-	ci, ok := m.connections[ev.ID]
-	if !ok {
-		ci = &connInfo{id: ev.ID, remote: ev.Remote, state: ev.State, files: make(map[string]*fileProg)}
-		m.connections[ev.ID] = ci
+func requestStateCmd(client *ipcapi.Client) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.State()
+		return stateMsg{snapshot: snap, err: err}
 	}
-	if ev.Remote != "" {
-		ci.remote = ev.Remote
-	}
-	if ev.State != "progress" {
-		ci.state = ev.State
-	}
-
-	if ev.State == "progress" && ev.File != "" {
-		fp, ok := ci.files[ev.File]
-		if !ok {
-			p := progress.New(progress.WithDefaultGradient())
-			p.Width = max(20, m.width-20)
-			fp = &fileProg{name: ev.File, total: ev.Total, bar: p}
-			ci.files[ev.File] = fp
-		}
-		fp.total = ev.Total
-		fp.transferred = ev.Transferred
-		pct := 0.0
-		if ev.Total > 0 {
-			pct = float64(ev.Transferred) / float64(ev.Total)
-		}
-		fp.bar.SetPercent(pct)
-	}
-
-	m.refreshConnList()
 }
 
-func (m *model) refreshConnList() {
-	items := make([]list.Item, 0, len(m.connections))
-	keys := make([]string, 0, len(m.connections))
-	for id := range m.connections {
-		keys = append(keys, id)
+func nextPollCmd() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+func setFilesCmd(client *ipcapi.Client, files []string) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.SetFiles(files)
+		return actionMsg{snapshot: snap, err: err}
 	}
-	sort.Strings(keys)
-	for _, id := range keys {
-		ci := m.connections[id]
-		items = append(items, connItem{id: ci.id, remote: ci.remote, state: ci.state})
+}
+
+func updateSettingsCmd(client *ipcapi.Client, settings senderdaemon.Settings) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.UpdateSettings(settings)
+		return actionMsg{snapshot: snap, err: err, clearDirty: true}
 	}
-	m.connList.SetItems(items)
+}
+
+func startSenderCmd(client *ipcapi.Client) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.StartSender()
+		return actionMsg{snapshot: snap, err: err}
+	}
+}
+
+func stopSenderCmd(client *ipcapi.Client) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.StopSender()
+		return actionMsg{snapshot: snap, err: err}
+	}
+}
+
+func startListenerCmd(client *ipcapi.Client) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.StartListener()
+		return actionMsg{snapshot: snap, err: err}
+	}
+}
+
+func stopListenerCmd(client *ipcapi.Client) tea.Cmd {
+	return func() tea.Msg {
+		snap, err := client.StopListener()
+		return actionMsg{snapshot: snap, err: err}
+	}
+}
+
+func listItemsToPaths(items []list.Item) []string {
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if fi, ok := it.(fileItem); ok {
+			out = append(out, fi.path)
+		}
+	}
+	return out
+}
+
+func appendUnique(in []string, path string) []string {
+	for _, p := range in {
+		if p == path {
+			return in
+		}
+	}
+	return append(in, path)
 }
 
 func max(a, b int) int {
@@ -451,33 +686,27 @@ func max(a, b int) int {
 	return b
 }
 
-func main() {
-	var (
-		certPath   = flag.String("cert", "certs/server.crt", "server cert path")
-		keyPath    = flag.String("key", "certs/server.key", "server key path")
-		caPath     = flag.String("ca", "certs/ca.crt", "CA bundle path")
-		addr       = flag.String("addr", ":8443", "TCP listen address")
-		multicast  = flag.String("multicast", "239.255.42.99:9999", "multicast group")
-		serverName = flag.String("server-name", "transfer.local", "server name advertised to clients")
-		id         = flag.String("id", "sender-1", "unique sender id")
-		insecure   = flag.Bool("insecure-skip-verify", false, "skip verifying client certificates (NOT recommended)")
+func runStatus(running bool) string {
+	if running {
+		return "ACTIVE"
+	}
+	return "INACTIVE"
+}
+
+func (m model) statusBanner() string {
+	return fmt.Sprintf(
+		"Sender: %s | Listener: %s",
+		runStatus(m.senderRunning),
+		runStatus(m.listenerRunning),
 	)
+}
+
+func main() {
+	ipcSocket := flag.String("ipc-socket", ipc.DefaultEndpoint, "unix socket path for daemon IPC")
 	flag.Parse()
 
-	cert, err := config.LoadCertificate(*certPath, *keyPath)
-	if err != nil {
-		log.Fatalf("load cert: %v", err)
-	}
-	var roots *x509.CertPool
-	if !*insecure {
-		r, err := config.LoadCertPool(*caPath)
-		if err != nil {
-			log.Fatalf("load ca: %v", err)
-		}
-		roots = r
-	}
-
-	m := newModel(cert, roots, *addr, *multicast, *serverName, *id, *insecure)
+	client := ipcapi.NewClient(*ipcSocket)
+	m := newModel(client)
 	if err := tea.NewProgram(m).Start(); err != nil {
 		log.Fatal(err)
 	}
