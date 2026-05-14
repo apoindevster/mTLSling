@@ -1,0 +1,73 @@
+name: Build
+
+on:
+  push:
+    tags:
+      - "*"
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            artifact_suffix: linux-amd64
+            extension: ""
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            artifact_suffix: macos-amd64
+            extension: ""
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            artifact_suffix: windows-amd64
+            extension: .exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.13"
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Create dist directory
+        run: mkdir dist
+
+      - name: Build senderd
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: >-
+          go build -trimpath -ldflags "-s -w"
+          -o dist/senderd-${{ matrix.artifact_suffix }}${{ matrix.extension }}
+          ./cmd/senderd
+
+      - name: Build tui
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: >-
+          go build -trimpath -ldflags "-s -w"
+          -o dist/tui-${{ matrix.artifact_suffix }}${{ matrix.extension }}
+          ./cmd/tui
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtlsling-${{ matrix.artifact_suffix }}
+          path: dist/*
+          if-no-files-found: error

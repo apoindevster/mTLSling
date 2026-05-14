@@ -5,7 +5,6 @@ Two Go binaries for local network file transfer with multicast discovery and mut
 ## Binaries
 - `senderd` (headless combined daemon): Runs both sender and listener components and exposes local IPC control APIs.
 - `tui` (Bubble Tea UI): UI-only controller. Talks to `senderd` over IPC to manage sender file selection, component settings, and sender/listener start-stop states.
-- `listener` (legacy standalone): Headless listener kept for compatibility; the combined daemon now supersedes it.
 
 ## Quick start
 1. Generate a small PKI (CA + server + client certs). Example:
@@ -57,13 +56,6 @@ Two Go binaries for local network file transfer with multicast discovery and mut
 - Pick sender files on the picker page.
 - Open settings page (`g`) to edit all sender/listener daemon arguments.
 - Toggle sender (`s`) and listener (`r`) from any page, or set `sender.enabled` / `listener.enabled` and press `w` on settings page to apply.
-
-5. Optional: run legacy standalone listener on another host (downloads into ./downloads by default):
-   ```bash
-   GOCACHE=/tmp/go-cache GOMODCACHE=/tmp/go-mod go run ./cmd/listener \
-     -cert certs/client.crt -key certs/client.key -ca certs/ca.crt \
-     -multicast "239.255.42.99:9999" -out downloads
-   ```
 
 ## Notes
 - Discovery messages are signed with the server certificate and verified against the CA bundle before any TCP connection is attempted.
